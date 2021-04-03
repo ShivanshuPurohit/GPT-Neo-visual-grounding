@@ -7,20 +7,26 @@ import torch.nn.functional as F
 from torch.nn.functional import normalize, cross_entropy
 from torch.nn import DataParallel
 from auto_tqdm import tqdm
+from get_args import get_args
+import deepspeed
 
+args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #initalize a smol boi
 config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
 #create model
 model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B")
-if torch.cuda.device_count() > 1:
-    model_dp = DataParallel(model)
-model_dp.to(device)
+model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
+                                                        model=model,
+                                                        model_parameters=model.parameters())
+#if torch.cuda.device_count() > 1:
+#    model_dp = DataParallel(model)
+model_engine.to(device)
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 
 #Initialize a random projection matrix
-neo_hidden = model.config.hidden_size
+neo_hidden = model_engine.config.hidden_size
 clip_hidden = 512
 projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(device)
 
@@ -144,12 +150,14 @@ data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
 loader = DataLoader(dataset=data, batch_size=1)
 
 #resize token embeddings
-model.resize_token_embeddings(len(data.tokenizer))
+model_engine.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
-opt = AdamW(list(model_dp.parameters()) + list(projection.parameters()), lr=learning_rate, weight_decay=weight_decay)
+#opt = AdamW(list(model_dp.parameters()) + list(projection.parameters()), lr=learning_rate, weight_decay=weight_decay)
 
-
+_, client_sd = model_engine.load_checkpoint(args.load_dir, args.ckpt_id)
+step = client_sd['step']
+loader_to_step(loader, step+1)
 #Set up progress bar
 pbar = tqdm(enumerate(loader), total=len(data))
 loss_progress = 0.0
@@ -166,7 +174,7 @@ for batch, data_elem in pbar:
     }
     loss = None
     #Used for CLIP. TODO: Fetch AR loss (Leo pls do this)
-    out_embeds = model_dp(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
+    out_embeds = model_engine(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
     
     # debug shapes
     #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
@@ -192,14 +200,14 @@ for batch, data_elem in pbar:
         loss += ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
     else:
         loss = ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
-
-    loss.backward()
+    loss = model_engine(batch)
+    model_engine.backward(loss)
     loss_progress += loss.detach().cpu().item()
     
     #Accumulate gradients
     if (batch+1)%grad_accum==0:
-        opt.step()
-        opt.zero_grad()
+        model_engine.step()
+        model_engine.zero_grad()
 
     #Update loss progress
     if (batch+1)%report_loss_every==0:
@@ -208,8 +216,12 @@ for batch, data_elem in pbar:
         loss_progress = 0.0
     #Save model
     if (batch+1)%save_every==0:
-        model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
+        client_sd['step'] = step
+        ckpt_id = loss.item()
+        model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
+        #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
         tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
 
-model.save_pretrained("GPT-Neo-Enriched")
+model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
+#model.save_pretrained("GPT-Neo-Enriched")
 tokenizer.save_pretrained("GPT-Neo-Enriched")
